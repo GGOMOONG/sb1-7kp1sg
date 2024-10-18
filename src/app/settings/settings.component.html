@@ -1,0 +1,23 @@
+<StackLayout class="p-4">
+  <Label text="Settings" class="text-2xl font-bold text-center mb-4"></Label>
+  
+  <Label text="Distance Threshold (cm)" class="text-lg"></Label>
+  <Slider [(ngModel)]="distanceThreshold" minValue="20" maxValue="50" step="1"></Slider>
+  <Label [text]="'Current: ' + distanceThreshold + ' cm'" class="text-sm text-gray-500"></Label>
+  <Label text="Recommended: 30 cm" class="text-sm text-blue-500"></Label>
+  
+  <Label text="Max Pause Count" class="text-lg mt-4"></Label>
+  <Slider [(ngModel)]="maxPauseCount" minValue="1" maxValue="10" step="1"></Slider>
+  <Label [text]="'Current: ' + maxPauseCount" class="text-sm text-gray-500"></Label>
+  
+  <Button text="Save Settings" (tap)="saveSettings()" class="btn btn-primary mt-4"></Button>
+  
+  <Label text="Supported Apps" class="text-lg mt-4"></Label>
+  <ListView [items]="supportedApps" class="list-group">
+    <ng-template let-app="item">
+      <Label [text]="app" class="list-group-item"></Label>
+    </ng-template>
+  </ListView>
+  
+  <Button text="Privacy Policy" (tap)="showPrivacyPolicy()" class="btn btn-secondary mt-4"></Button>
+</StackLayout>

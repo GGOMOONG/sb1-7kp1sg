@@ -1,0 +1,35 @@
+.text-2xl {
+  font-size: 24;
+}
+
+.text-xl {
+  font-size: 18;
+}
+
+.font-bold {
+  font-weight: bold;
+}
+
+.text-center {
+  text-align: center;
+}
+
+.m-4 {
+  margin: 16;
+}
+
+.bg-red-500 {
+  background-color: #ef4444;
+}
+
+.p-4 {
+  padding: 16;
+}
+
+.text-white {
+  color: white;
+}
+
+.mt-2 {
+  margin-top: 8;
+}
