@@ -1,243 +1,231 @@
-// ESP32 스마트글래스 BLE 탐지기
+// ESP32 휴대용 스마트글래스 탐지/추적기
 //
-// 주변 BLE 광고 패킷을 계속 스캔하면서, 스마트글래스 제조사 Company ID 또는
-// 기기 이름 키워드와 일치하는 기기만 골라 시리얼/LED/부저로 알려줍니다.
+// - BLE 광고를 듀티 100%로 계속 스캔해서 스마트글래스만 골라냅니다.
+// - 폰에 연결되어 광고가 드문 안경도 잡도록 오래 기억하고, 주소가 바뀌어도 이어서 추적합니다.
+// - OLED에 목록을 보여주고, 한 대를 골라 "추적 모드"로 들어가면
+//   신호 세기에 따라 부저가 가이거 계수기처럼 빨라져서 걸으면서 위치를 찾을 수 있습니다.
 //
-// 라이브러리: NimBLE-Arduino 2.x (기본 Arduino BLE보다 메모리를 훨씬 적게 씀)
+// 버튼(BOOT, GPIO0)
+//   목록 화면: 짧게 = 다음 대상,  길게(0.7초) = 선택한 대상 추적
+//   추적 화면: 짧게 = 소리 켜기/끄기, 길게 = 목록으로
+//   아무 화면: 아주 길게(3초) = 소리 켜기/끄기
 
 #include <Arduino.h>
-#include <NimBLEDevice.h>
 
-#include <cctype>
-#include <cstring>
-#include <string>
+#include "config.h"
+#include "detector.h"
+#include "display.h"
 
-#include "signatures.h"
+namespace {
 
-// ---------------- 설정 ----------------
-static const int LED_PIN = 2;             // 대부분의 ESP32 DevKit 내장 LED. 없으면 -1
-static const int BUZZER_PIN = -1;         // 액티브 부저 연결 시 GPIO 번호 (예: 25)
-static const int RSSI_THRESHOLD = -90;    // 이보다 약한 신호는 무시 (dBm)
-static const Confidence MIN_ALERT_CONFIDENCE = CONF_MEDIUM;  // 알림을 울릴 최소 신뢰도
-static const uint32_t REALERT_MS = 30000; // 같은 기기를 다시 알릴 최소 간격
-static const uint32_t FORGET_MS = 60000;  // 이 시간 동안 안 보이면 목록에서 제거
-static const uint32_t SUMMARY_MS = 5000;  // 주변 탐지 요약 출력 주기
-static const bool RAW_DUMP = false;       // true면 모든 광고 패킷을 출력 (시그니처 수집용)
-// --------------------------------------
+enum Mode { MODE_LIST, MODE_TRACK };
+Mode mode = MODE_LIST;
+uint16_t selectedId = 0;
+uint16_t trackId = 0;
+bool muted = false;
+uint32_t alertUntil = 0;
+Target alertTarget;
 
-struct Detection {
-  char address[18];
-  char name[32];
-  char vendor[40];
-  uint16_t companyId;
-  int8_t rssi;
-  Confidence confidence;
-};
+// ---------------- LED / 부저 (non-blocking) ----------------
+struct Beeper {
+  uint8_t remaining = 0;
+  bool on = false;
+  uint32_t nextMs = 0;
+  uint16_t onMs = 0, offMs = 0;
+} beeper;
 
-struct TrackedDevice {
-  bool used;
-  char address[18];
-  char vendor[40];
-  int8_t rssi;
-  Confidence confidence;
-  uint32_t lastSeen;
-  uint32_t lastAlert;
-};
-
-static const size_t MAX_TRACKED = 32;
-static TrackedDevice tracked[MAX_TRACKED];
-static QueueHandle_t detectionQueue;
-
-static bool containsIgnoreCase(const std::string& haystack, const char* needle) {
-  size_t n = strlen(needle);
-  if (n == 0 || haystack.size() < n) return false;
-  for (size_t i = 0; i + n <= haystack.size(); i++) {
-    size_t j = 0;
-    while (j < n && std::tolower((unsigned char)haystack[i + j]) == std::tolower((unsigned char)needle[j])) j++;
-    if (j == n) return true;
-  }
-  return false;
+void setOutputs(bool on) {
+  if (LED_PIN >= 0) digitalWrite(LED_PIN, (on != (bool)LED_ACTIVE_LOW) ? HIGH : LOW);
+  if (BUZZER_PIN >= 0) digitalWrite(BUZZER_PIN, (on && !muted) ? HIGH : LOW);
 }
 
-static const char* proximityLabel(int rssi) {
-  if (rssi >= -55) return "매우 가까움(~1m)";
-  if (rssi >= -70) return "가까움(~3m)";
-  if (rssi >= -80) return "근처(~10m)";
-  return "먼 거리";
+void beep(uint8_t count, uint16_t onMs, uint16_t offMs) {
+  beeper.remaining = count;
+  beeper.onMs = onMs;
+  beeper.offMs = offMs;
+  beeper.on = false;
+  beeper.nextMs = millis();
 }
 
-static const char* confidenceLabel(Confidence c) {
-  switch (c) {
-    case CONF_HIGH: return "HIGH";
-    case CONF_MEDIUM: return "MEDIUM";
-    case CONF_LOW: return "LOW";
-    default: return "-";
+void beeperUpdate(uint32_t now) {
+  if (beeper.remaining == 0 && !beeper.on) return;
+  if ((int32_t)(now - beeper.nextMs) < 0) return;
+  if (beeper.on) {
+    beeper.on = false;
+    setOutputs(false);
+    beeper.nextMs = now + beeper.offMs;
+  } else if (beeper.remaining > 0) {
+    beeper.remaining--;
+    beeper.on = true;
+    setOutputs(true);
+    beeper.nextMs = now + beeper.onMs;
   }
 }
 
-// 광고 패킷 하나를 시그니처와 비교. BLE 호스트 태스크에서 호출되므로 가볍게 유지.
-static bool classify(const NimBLEAdvertisedDevice* dev, Detection& out) {
-  Confidence conf = CONF_NONE;
-  const char* vendor = nullptr;
-  uint16_t companyId = 0xFFFF;
-
-  if (dev->haveManufacturerData()) {
-    std::string mfr = dev->getManufacturerData();
-    if (mfr.size() >= 2) {
-      companyId = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);  // little-endian
-      for (size_t i = 0; i < COMPANY_SIGNATURE_COUNT; i++) {
-        if (COMPANY_SIGNATURES[i].companyId == companyId) {
-          conf = COMPANY_SIGNATURES[i].confidence;
-          vendor = COMPANY_SIGNATURES[i].vendor;
-          break;
-        }
-      }
-    }
-  }
-
-  std::string name = dev->haveName() ? dev->getName() : std::string();
-  if (!name.empty()) {
-    for (size_t i = 0; i < NAME_SIGNATURE_COUNT; i++) {
-      if (containsIgnoreCase(name, NAME_SIGNATURES[i].keyword)) {
-        if (conf == CONF_NONE) {
-          conf = CONF_LOW;
-          vendor = NAME_SIGNATURES[i].vendor;
-        } else {
-          conf = CONF_HIGH;  // 제조사 ID + 이름이 모두 일치
-        }
+// ---------------- 배터리 ----------------
+int batteryPercent() {
+  if (BAT_ADC_PIN < 0) return -1;
+  static int cached = -1;
+  static uint32_t lastMs = 0;
+  if (cached >= 0 && millis() - lastMs < 5000) return cached;
+  lastMs = millis();
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(BAT_ADC_PIN);
+  float mv = (sum / 8.0f) * BAT_DIVIDER;
+  // LiPo 1셀 방전 곡선 근사
+  static const int16_t curve[][2] = {{4200, 100}, {4100, 90}, {4000, 80}, {3900, 65}, {3800, 50},
+                                     {3700, 35},  {3600, 20}, {3500, 10}, {3300, 0}};
+  int pct = 0;
+  if (mv >= curve[0][0]) {
+    pct = 100;
+  } else {
+    for (size_t i = 1; i < sizeof(curve) / sizeof(curve[0]); i++) {
+      if (mv >= curve[i][0]) {
+        float f = (mv - curve[i][0]) / (float)(curve[i - 1][0] - curve[i][0]);
+        pct = curve[i][1] + f * (curve[i - 1][1] - curve[i][1]);
         break;
       }
     }
   }
-
-  if (conf == CONF_NONE) return false;
-
-  memset(&out, 0, sizeof(out));
-  strncpy(out.address, dev->getAddress().toString().c_str(), sizeof(out.address) - 1);
-  strncpy(out.name, name.c_str(), sizeof(out.name) - 1);
-  strncpy(out.vendor, vendor ? vendor : "?", sizeof(out.vendor) - 1);
-  out.companyId = companyId;
-  out.rssi = (int8_t)dev->getRSSI();
-  out.confidence = conf;
-  return true;
+  cached = pct;
+  return pct;
 }
 
-class ScanCallbacks : public NimBLEScanCallbacks {
-  void onResult(const NimBLEAdvertisedDevice* dev) override {
-    if (RAW_DUMP) {
-      Serial.printf("[RAW] %s\n", dev->toString().c_str());
+// ---------------- 버튼 ----------------
+enum Press { PRESS_NONE, PRESS_SHORT, PRESS_LONG, PRESS_VERY_LONG };
+
+Press readButton(uint32_t now) {
+  static bool down = false;
+  static uint32_t downMs = 0;
+  static bool longFired = false;
+  bool pressed = digitalRead(BUTTON_PIN) == LOW;
+  if (pressed && !down) {
+    down = true;
+    downMs = now;
+    longFired = false;
+  } else if (pressed && down) {
+    if (!longFired && now - downMs >= 3000) {
+      longFired = true;
+      return PRESS_VERY_LONG;
     }
-    if (dev->getRSSI() < RSSI_THRESHOLD) return;
-    Detection d;
-    if (classify(dev, d)) {
-      xQueueSend(detectionQueue, &d, 0);  // 큐가 가득 차면 그냥 버림
-    }
+  } else if (!pressed && down) {
+    down = false;
+    uint32_t held = now - downMs;
+    if (longFired || held < 40) return PRESS_NONE;  // 3초 처리 완료 또는 채터링
+    return held >= 700 ? PRESS_LONG : PRESS_SHORT;
   }
-
-  void onScanEnd(const NimBLEScanResults& results, int reason) override {
-    NimBLEDevice::getScan()->start(0, false, true);  // 혹시 멈추면 재시작
-  }
-};
-
-static void alert(Confidence conf) {
-  int beeps = (conf == CONF_HIGH) ? 3 : 1;
-  for (int i = 0; i < beeps; i++) {
-    if (LED_PIN >= 0) digitalWrite(LED_PIN, HIGH);
-    if (BUZZER_PIN >= 0) digitalWrite(BUZZER_PIN, HIGH);
-    delay(120);
-    if (LED_PIN >= 0) digitalWrite(LED_PIN, LOW);
-    if (BUZZER_PIN >= 0) digitalWrite(BUZZER_PIN, LOW);
-    delay(120);
-  }
+  return PRESS_NONE;
 }
 
-static TrackedDevice* findOrCreate(const char* address, uint32_t now) {
-  TrackedDevice* freeSlot = nullptr;
-  TrackedDevice* oldest = &tracked[0];
-  for (size_t i = 0; i < MAX_TRACKED; i++) {
-    if (tracked[i].used && strcmp(tracked[i].address, address) == 0) return &tracked[i];
-    if (!tracked[i].used && !freeSlot) freeSlot = &tracked[i];
-    if (tracked[i].lastSeen < oldest->lastSeen) oldest = &tracked[i];
-  }
-  TrackedDevice* slot = freeSlot ? freeSlot : oldest;
-  memset(slot, 0, sizeof(*slot));
-  slot->used = true;
-  strncpy(slot->address, address, sizeof(slot->address) - 1);
-  return slot;
-}
-
-static void handleDetection(const Detection& d) {
-  uint32_t now = millis();
-  TrackedDevice* t = findOrCreate(d.address, now);
-  bool isNew = (t->lastSeen == 0);
-  t->lastSeen = now;
-  t->rssi = d.rssi;
-  if (d.confidence > t->confidence) t->confidence = d.confidence;
-  strncpy(t->vendor, d.vendor, sizeof(t->vendor) - 1);
-
-  if (t->confidence < MIN_ALERT_CONFIDENCE) return;
-  if (!isNew && t->lastAlert != 0 && now - t->lastAlert < REALERT_MS) return;
-  t->lastAlert = now;
-
+// ---------------- 알림 ----------------
+void onAlert(const Target& t) {
   Serial.println();
   Serial.println("========== 스마트글래스 감지 ==========");
-  Serial.printf(" 제조사/모델 : %s\n", d.vendor);
-  Serial.printf(" 신뢰도      : %s\n", confidenceLabel(t->confidence));
-  Serial.printf(" 신호 세기   : %d dBm (%s)\n", d.rssi, proximityLabel(d.rssi));
-  Serial.printf(" BLE 주소    : %s\n", d.address);
-  if (d.name[0]) Serial.printf(" 기기 이름   : %s\n", d.name);
-  if (d.companyId != 0xFFFF) Serial.printf(" Company ID  : 0x%04X\n", d.companyId);
+  Serial.printf(" 제조사/모델 : %s\n", t.vendor);
+  Serial.printf(" 신뢰도      : %s\n", confidenceLabel(t.confidence));
+  Serial.printf(" 신호 세기   : %d dBm (%s)\n", t.lastRssi, proximityLabel(t.lastRssi));
+  Serial.printf(" 사용 상태   : %s (추정)\n", usageLabel(usageState(t)));
+  Serial.printf(" BLE 주소    : %s\n", t.address);
+  if (t.name[0]) Serial.printf(" 기기 이름   : %s\n", t.name);
+  if (t.companyId != 0xFFFF) Serial.printf(" Company ID  : 0x%04X\n", t.companyId);
   Serial.println("========================================");
-  alert(t->confidence);
+
+  if (mode == MODE_TRACK) {
+    beep(1, 40, 0);  // 추적 중에는 화면을 가리지 않고 짧게만 알림
+    return;
+  }
+  alertTarget = t;
+  alertUntil = millis() + 2000;
+  if (t.confidence >= CONF_HIGH) beep(3, 120, 120);
+  else beep(1, 150, 0);
 }
 
-static void printSummary() {
-  uint32_t now = millis();
-  int count = 0;
-  for (size_t i = 0; i < MAX_TRACKED; i++) {
-    TrackedDevice& t = tracked[i];
-    if (!t.used) continue;
-    if (now - t.lastSeen > FORGET_MS) {
-      t.used = false;
-      continue;
-    }
-    if (t.confidence < MIN_ALERT_CONFIDENCE) continue;
-    if (count == 0) Serial.println("[주변] 현재 감지 중인 스마트글래스:");
-    count++;
-    Serial.printf("  - %-32s %4d dBm  %-18s %s (%lus 전)\n", t.vendor, t.rssi, proximityLabel(t.rssi),
-                  confidenceLabel(t.confidence), (unsigned long)((now - t.lastSeen) / 1000));
+// 추적 모드: 신호가 강할수록 빠르게 삑삑 (가이거 계수기 방식)
+void trackerBeep(const Target& t, uint32_t now) {
+  static uint32_t lastBeep = 0;
+  if (now - t.lastSeen > 3000) return;  // 신호가 끊기면 조용히
+  float r = constrain(t.emaRssi, -95.0f, -45.0f);
+  uint32_t period = (uint32_t)(80 + (r + 45.0f) / -50.0f * 1420);  // -45dBm: 80ms, -95dBm: 1500ms
+  if (now - lastBeep >= period && beeper.remaining == 0 && !beeper.on) {
+    lastBeep = now;
+    beep(1, 25, 0);
   }
-  if (count == 0) Serial.println("[주변] 감지된 스마트글래스 없음");
 }
+
+}  // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   if (LED_PIN >= 0) pinMode(LED_PIN, OUTPUT);
   if (BUZZER_PIN >= 0) pinMode(BUZZER_PIN, OUTPUT);
+  setOutputs(false);
+  if (BAT_ADC_PIN >= 0) analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
 
-  detectionQueue = xQueueCreate(32, sizeof(Detection));
-
-  NimBLEDevice::init("");
-  NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(new ScanCallbacks(), true);  // true: 같은 기기 반복 수신 허용 (RSSI 갱신용)
-  scan->setActiveScan(true);  // Scan Response까지 받아야 기기 이름이 보이는 경우가 많음
-  scan->setInterval(100);
-  scan->setWindow(99);
-  scan->setMaxResults(0);  // 결과를 메모리에 쌓지 않음 (콜백만 사용)
-  scan->start(0, false, true);  // 0 = 무한 스캔
-
+  displayBegin();
+  detectorBegin();
   Serial.println("스마트글래스 BLE 탐지기 시작 - 스캔 중...");
+  if (LOG_OBSERVATIONS) Serial.println("OBS,ms,id,address,company_id,rssi,connectable,legacy,name");
 }
 
 void loop() {
-  static uint32_t lastSummary = 0;
-  Detection d;
-  while (xQueueReceive(detectionQueue, &d, pdMS_TO_TICKS(100)) == pdTRUE) {
-    handleDetection(d);
+  static Target list[16];
+  static uint32_t lastDraw = 0;
+  uint32_t now = millis();
+
+  detectorProcess(onAlert);
+  beeperUpdate(now);
+  size_t n = detectorSnapshot(list, 16);
+
+  // 선택 상태는 순서가 바뀌어도 유지되도록 id로 기억합니다
+  size_t sel = 0;
+  for (size_t i = 0; i < n; i++)
+    if (list[i].id == selectedId) sel = i;
+  if (n > 0) selectedId = list[sel].id;
+
+  switch (readButton(now)) {
+    case PRESS_SHORT:
+      if (mode == MODE_LIST && n > 0) {
+        sel = (sel + 1) % n;
+        selectedId = list[sel].id;
+      } else if (mode == MODE_TRACK) {
+        muted = !muted;
+      }
+      alertUntil = 0;
+      break;
+    case PRESS_LONG:
+      if (mode == MODE_LIST && n > 0) {
+        mode = MODE_TRACK;
+        trackId = selectedId;
+        Serial.printf("[추적 시작] #%u %s\n", trackId, list[sel].vendor);
+      } else if (mode == MODE_TRACK) {
+        mode = MODE_LIST;
+      }
+      alertUntil = 0;
+      break;
+    case PRESS_VERY_LONG:
+      muted = !muted;
+      beep(1, 60, 0);
+      break;
+    default:
+      break;
   }
-  if (millis() - lastSummary >= SUMMARY_MS) {
-    lastSummary = millis();
-    printSummary();
+
+  Target tracked;
+  bool haveTracked = (mode == MODE_TRACK) && detectorGet(trackId, tracked);
+  if (haveTracked) trackerBeep(tracked, now);
+
+  if (now - lastDraw >= 120) {
+    lastDraw = now;
+    UiStatus st{batteryPercent(), muted, detectorPacketsPerSec()};
+    if (alertUntil && (int32_t)(alertUntil - now) > 0) {
+      displayAlert(alertTarget);
+    } else if (mode == MODE_TRACK) {
+      displayTrack(haveTracked ? &tracked : nullptr, st);
+    } else {
+      displayList(list, n, sel, st);
+    }
   }
+  delay(5);
 }
