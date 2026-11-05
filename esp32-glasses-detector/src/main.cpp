@@ -91,9 +91,31 @@ int batteryPercent() {
   return pct;
 }
 
-// ---------------- 버튼 ----------------
+// ---------------- 입력 ----------------
+// 화면/버튼 구성에 상관없이 loop는 Action만 처리합니다.
+//  단일 버튼(BOOT): 짧게=다음/음소거, 길게=선택/뒤로, 아주길게=음소거
+//  3버튼(TFT 보드): A=다음, B=선택/뒤로, C=음소거
+enum Action { ACT_NONE, ACT_NEXT, ACT_SELECT, ACT_BACK, ACT_MUTE };
 enum Press { PRESS_NONE, PRESS_SHORT, PRESS_LONG, PRESS_VERY_LONG };
 
+#if defined(THREE_BUTTONS)
+// 3버튼: 각 핀 눌림 에지를 디바운스해서 감지 (active-low, 외부 풀업)
+bool edge(int pin, bool& last, uint32_t& tms, uint32_t now) {
+  bool pressed = digitalRead(pin) == LOW;
+  bool fired = false;
+  if (pressed && !last && now - tms > 150) { fired = true; tms = now; }
+  last = pressed;
+  return fired;
+}
+Action pollInput(uint32_t now, bool inTrack) {
+  static bool la = false, lb = false, lc = false;
+  static uint32_t ta = 0, tb = 0, tc = 0;
+  if (edge(BTN_A_PIN, la, ta, now)) return ACT_NEXT;
+  if (edge(BTN_B_PIN, lb, tb, now)) return inTrack ? ACT_BACK : ACT_SELECT;
+  if (edge(BTN_C_PIN, lc, tc, now)) return ACT_MUTE;
+  return ACT_NONE;
+}
+#else
 Press readButton(uint32_t now) {
   static bool down = false;
   static uint32_t downMs = 0;
@@ -116,6 +138,15 @@ Press readButton(uint32_t now) {
   }
   return PRESS_NONE;
 }
+Action pollInput(uint32_t now, bool inTrack) {
+  switch (readButton(now)) {
+    case PRESS_SHORT: return inTrack ? ACT_MUTE : ACT_NEXT;
+    case PRESS_LONG: return inTrack ? ACT_BACK : ACT_SELECT;
+    case PRESS_VERY_LONG: return ACT_MUTE;
+    default: return ACT_NONE;
+  }
+}
+#endif
 
 // ---------------- 알림 ----------------
 void onAlert(const Target& t) {
@@ -157,7 +188,13 @@ void trackerBeep(const Target& t, uint32_t now) {
 void setup() {
   Serial.begin(115200);
   delay(200);
+#if defined(THREE_BUTTONS)
+  pinMode(BTN_A_PIN, INPUT_PULLUP);
+  pinMode(BTN_B_PIN, INPUT_PULLUP);
+  pinMode(BTN_C_PIN, INPUT_PULLUP);
+#else
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+#endif
   if (LED_PIN >= 0) pinMode(LED_PIN, OUTPUT);
   if (BUZZER_PIN >= 0) pinMode(BUZZER_PIN, OUTPUT);
   setOutputs(false);
@@ -184,33 +221,29 @@ void loop() {
     if (list[i].id == selectedId) sel = i;
   if (n > 0) selectedId = list[sel].id;
 
-  switch (readButton(now)) {
-    case PRESS_SHORT:
-      if (mode == MODE_LIST && n > 0) {
-        sel = (sel + 1) % n;
-        selectedId = list[sel].id;
-      } else if (mode == MODE_TRACK) {
-        muted = !muted;
-      }
-      alertUntil = 0;
+  Action act = pollInput(now, mode == MODE_TRACK);
+  switch (act) {
+    case ACT_NEXT:
+      if (mode == MODE_LIST && n > 0) { sel = (sel + 1) % n; selectedId = list[sel].id; }
       break;
-    case PRESS_LONG:
+    case ACT_SELECT:
       if (mode == MODE_LIST && n > 0) {
         mode = MODE_TRACK;
         trackId = selectedId;
         Serial.printf("[추적 시작] #%u %s\n", trackId, list[sel].vendor);
-      } else if (mode == MODE_TRACK) {
-        mode = MODE_LIST;
       }
-      alertUntil = 0;
       break;
-    case PRESS_VERY_LONG:
+    case ACT_BACK:
+      mode = MODE_LIST;
+      break;
+    case ACT_MUTE:
       muted = !muted;
       beep(1, 60, 0);
       break;
     default:
       break;
   }
+  if (act != ACT_NONE) alertUntil = 0;
 
   Target tracked;
   bool haveTracked = (mode == MODE_TRACK) && detectorGet(trackId, tracked);

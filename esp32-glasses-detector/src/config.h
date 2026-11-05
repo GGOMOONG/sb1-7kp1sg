@@ -1,6 +1,7 @@
 // 하드웨어 핀과 동작 설정
 // 보드마다 다른 핀은 platformio.ini의 build_flags(-D...)로 덮어씁니다.
 #pragma once
+#include <cstdint>
 
 // ---------- 화면 (SSD1306 / SH1106 128x64 I2C OLED) ----------
 #ifndef OLED_SDA
@@ -14,10 +15,46 @@
 #define OLED_SH1106 0
 #endif
 
+// ---------- 컬러 TFT (XIAO ESP32-S3 Plus 1.14" IPS, ST7789 135x240) ----------
+// platformio.ini의 xiao_s3_plus_114 환경에서 -DDISPLAY_TFT로 켜집니다.
+// 핀은 Seeed 위키 + arduino-esp32 XIAO_ESP32S3_Plus variant 기준(raw GPIO).
+#ifdef DISPLAY_TFT
+  #define TFT_SCLK 7    // D8
+  #define TFT_MOSI 9    // D10
+  #define TFT_CS   3    // D2
+  #define TFT_DC   4    // D3
+  #define TFT_RST  13   // D17
+  #define TFT_BL   12   // D18 (백라이트)
+  #define TFT_W    135
+  #define TFT_H    240
+  #ifndef TFT_ROTATION
+  #define TFT_ROTATION 3   // 가로 모드(240x135). 화면이 뒤집히면 1로
+  #endif
+  #ifndef TFT_COL_OFFSET
+  #define TFT_COL_OFFSET 52  // 135x240 패널 오프셋. 화면이 밀리면 조정
+  #endif
+  #ifndef TFT_ROW_OFFSET
+  #define TFT_ROW_OFFSET 40
+  #endif
+  #ifndef TFT_INVERT
+  #define TFT_INVERT 1       // ST7789 IPS는 보통 반전 켜짐. 색이 이상하면 0
+  #endif
+#endif
+
 // ---------- 버튼 ----------
-// 모든 ESP32 보드에 있는 BOOT 버튼(GPIO0)을 그대로 씁니다. 추가 배선이 필요 없습니다.
+// 단일 버튼(기본): 모든 ESP32 보드의 BOOT 버튼(GPIO0). 추가 배선 불필요.
+// 3버튼(TFT 보드): THREE_BUTTONS + BTN_A/B/C 를 build_flags로 지정.
 #ifndef BUTTON_PIN
 #define BUTTON_PIN 0
+#endif
+#ifndef BTN_A_PIN
+#define BTN_A_PIN -1   // 다음/위
+#endif
+#ifndef BTN_B_PIN
+#define BTN_B_PIN -1   // 선택(추적 진입)/뒤로
+#endif
+#ifndef BTN_C_PIN
+#define BTN_C_PIN -1   // 음소거
 #endif
 
 // ---------- 알림 ----------

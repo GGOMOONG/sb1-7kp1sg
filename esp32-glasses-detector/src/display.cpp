@@ -1,9 +1,11 @@
+// 흑백 OLED(SSD1306/SH1106)용. 컬러 TFT 보드에서는 display_tft.cpp가 대신 쓰입니다.
+#include "config.h"
+#ifndef DISPLAY_TFT
+
 #include "display.h"
 
 #include <U8g2lib.h>
 #include <Wire.h>
-
-#include "config.h"
 
 namespace {
 
@@ -167,3 +169,5 @@ void displayAlert(const Target& t) {
   u8g2.setDrawColor(1);
   u8g2.sendBuffer();
 }
+
+#endif  // !DISPLAY_TFT
