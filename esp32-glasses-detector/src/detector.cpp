@@ -19,6 +19,7 @@ struct Observation {
   uint32_t fingerprint;
   int8_t rssi;
   Confidence confidence;
+  Category category;
   bool connectable;
   bool legacy;
   uint32_t ms;
@@ -57,19 +58,24 @@ uint32_t fnv1a(uint32_t h, const void* data, size_t len) {
 bool classify(const NimBLEAdvertisedDevice* dev, Observation& out) {
   Confidence conf = CONF_NONE;
   const char* vendor = nullptr;
+  Category cat = CAT_NONE;
   uint16_t companyId = 0xFFFF;
   size_t mfrLen = 0;
+  bool haveMfr = false;
+  uint16_t firstCid = 0xFFFF;
 
   // 한 패킷에 Manufacturer Data가 여러 개 들어 있을 수 있어서 모두 확인합니다
   uint8_t mfrCount = dev->getManufacturerDataCount();
-  for (uint8_t m = 0; m < mfrCount && conf == CONF_NONE; m++) {
+  for (uint8_t m = 0; m < mfrCount && cat != CAT_GLASSES; m++) {
     std::string mfr = dev->getManufacturerData(m);
     if (mfr.size() < 2) continue;
     uint16_t cid = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);
-    for (size_t i = 0; i < COMPANY_SIGNATURE_COUNT; i++) {
+    if (!haveMfr) { haveMfr = true; firstCid = cid; mfrLen = mfr.size(); }
+    for (size_t i = 0; i < COMPANY_SIGNATURE_COUNT; i++) {  // ① 안경 화이트리스트
       if (COMPANY_SIGNATURES[i].companyId == cid) {
         conf = COMPANY_SIGNATURES[i].confidence;
         vendor = COMPANY_SIGNATURES[i].vendor;
+        cat = CAT_GLASSES;
         companyId = cid;
         mfrLen = mfr.size();
         break;
@@ -77,13 +83,15 @@ bool classify(const NimBLEAdvertisedDevice* dev, Observation& out) {
     }
   }
 
+  // ② 이름 키워드 (안경 이름이면 새로 잡거나 신뢰도 상향)
   std::string name = dev->haveName() ? dev->getName() : std::string();
   if (!name.empty()) {
     for (size_t i = 0; i < NAME_SIGNATURE_COUNT; i++) {
       if (containsIgnoreCase(name, NAME_SIGNATURES[i].keyword)) {
-        if (conf == CONF_NONE) {
+        if (cat != CAT_GLASSES) {
           conf = NAME_SIGNATURES[i].confidence;
           vendor = NAME_SIGNATURES[i].vendor;
+          cat = CAT_GLASSES;
         } else {
           conf = CONF_HIGH;
         }
@@ -91,7 +99,28 @@ bool classify(const NimBLEAdvertisedDevice* dev, Observation& out) {
       }
     }
   }
-  if (conf == CONF_NONE) return false;
+
+  // ③ 안경이 아니면 블랙리스트(무시) / 미확인 칩 벤더(의심) 판정
+  if (cat != CAT_GLASSES && haveMfr) {
+    for (size_t i = 0; i < DENY_COMPANY_COUNT; i++)
+      if (DENY_COMPANIES[i] == firstCid) return false;  // 이어폰/워치/폰 등 → 무시
+    for (size_t i = 0; i < SUSPECT_COMPANY_COUNT; i++) {
+      if (SUSPECT_COMPANIES[i].companyId == firstCid) {
+        // 연결 가능한 것만 (무작위 비콘 노이즈 제거). 싸구려 카메라 제어채널은 보통 연결형.
+        if (!dev->isConnectable()) return false;
+        cat = CAT_UNKNOWN;
+        conf = SUSPECT_COMPANIES[i].confidence;
+        vendor = SUSPECT_COMPANIES[i].vendor;
+        companyId = firstCid;
+        break;
+      }
+    }
+  }
+
+  if (cat == CAT_NONE) return false;
+#if !SHOW_UNKNOWN
+  if (cat == CAT_UNKNOWN) return false;
+#endif
 
   memset(&out, 0, sizeof(out));
   strncpy(out.address, dev->getAddress().toString().c_str(), sizeof(out.address) - 1);
@@ -100,6 +129,7 @@ bool classify(const NimBLEAdvertisedDevice* dev, Observation& out) {
   out.companyId = companyId;
   out.rssi = (int8_t)dev->getRSSI();
   out.confidence = conf;
+  out.category = cat;
   out.connectable = dev->isConnectable();
   out.legacy = dev->isLegacyAdvertisement();
   out.ms = millis();
@@ -198,6 +228,7 @@ void ingest(const Observation& o, void (*onAlert)(const Target&)) {
   t->lastLegacy = o.legacy;
   if (o.name[0]) strncpy(t->name, o.name, sizeof(t->name) - 1);
   if (o.confidence > t->confidence) t->confidence = o.confidence;
+  if (o.category > t->category) t->category = o.category;  // UNKNOWN→GLASSES 승격 허용
 
   if (LOG_OBSERVATIONS) {
     // CSV: OBS,시간ms,id,주소,companyId,rssi,connectable,legacy,이름
@@ -265,18 +296,29 @@ void detectorProcess(void (*onAlert)(const Target&)) {
 size_t detectorSnapshot(Target* out, size_t max) {
   size_t n = 0;
   for (auto& t : targets) {
-    if (!t.used || t.confidence < CONF_MEDIUM) continue;
+    if (!t.used) continue;
+    // 안경(확신 MEDIUM 이상) + 미확인(의심) 기기를 표시
+    bool show = (t.category == CAT_GLASSES && t.confidence >= CONF_MEDIUM) || t.category == CAT_UNKNOWN;
+    if (!show) continue;
     if (n < max) out[n++] = t;
   }
-  // 최근에 보인 대상 먼저, 그 안에서는 신호가 강한 순서
+  // 정렬: 안경 먼저 → 최근에 보인 것 → 신호 강한 순
   uint32_t now = millis();
   for (size_t i = 1; i < n; i++) {
     Target key = out[i];
     bool keyActive = now - key.lastSeen < ACTIVE_MS;
     size_t j = i;
     while (j > 0) {
-      bool prevActive = now - out[j - 1].lastSeen < ACTIVE_MS;
-      bool keyFirst = (keyActive && !prevActive) || (keyActive == prevActive && key.emaRssi > out[j - 1].emaRssi);
+      Target& p = out[j - 1];
+      bool prevActive = now - p.lastSeen < ACTIVE_MS;
+      bool keyFirst;
+      if (key.category != p.category) {
+        keyFirst = (key.category == CAT_GLASSES);  // 안경을 미확인보다 위로
+      } else if (keyActive != prevActive) {
+        keyFirst = keyActive;
+      } else {
+        keyFirst = key.emaRssi > p.emaRssi;
+      }
       if (!keyFirst) break;
       out[j] = out[j - 1];
       j--;

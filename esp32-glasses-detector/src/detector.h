@@ -20,6 +20,7 @@ struct Target {
   uint16_t companyId;
   uint32_t fingerprint;
   Confidence confidence;
+  Category category;    // CAT_GLASSES 또는 CAT_UNKNOWN
 
   int8_t lastRssi;
   float emaRssi;        // 평활화한 RSSI

@@ -84,8 +84,10 @@ void displayBegin() {
 void displayList(const Target* list, size_t n, size_t selected, const UiStatus& st) {
   uint32_t now = millis();
   gfx->fillScreen(C_BG);
-  char title[20];
-  snprintf(title, sizeof(title), "GLASSES  %u", (unsigned)n);
+  size_t nG = 0, nU = 0;
+  for (size_t i = 0; i < n; i++) (list[i].category == CAT_UNKNOWN ? nU : nG)++;
+  char title[24];
+  snprintf(title, sizeof(title), "GLASSES %u  ? %u", (unsigned)nG, (unsigned)nU);
   drawHeader(title, st);
 
   if (n == 0) {
@@ -108,12 +110,16 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
     bool active = now - t.lastSeen < ACTIVE_MS;
     if (first + r == selected) gfx->fillRect(0, y, W, rowH - 1, C_SEL);
 
+    bool unknown = (t.category == CAT_UNKNOWN);
     UsageState us = usageState(t);
-    gfx->fillRect(3, y + 5, 5, rowH - 11, usageColor(us));  // 상태 색 점
-    text(13, y + 3, t.vendor, C_FG, 1);
+    gfx->fillRect(3, y + 5, 5, rowH - 11, unknown ? C_DIM : usageColor(us));  // 상태 색 점
+    text(13, y + 3, t.vendor, unknown ? C_DIM : C_FG, 1);
 
     char info[20];
-    snprintf(info, sizeof(info), "%s%s", confidenceLabel(t.confidence), us == USAGE_CONNECTED ? " USE" : "");
+    if (unknown)
+      snprintf(info, sizeof(info), "? unidentified");
+    else
+      snprintf(info, sizeof(info), "%s%s", confidenceLabel(t.confidence), us == USAGE_CONNECTED ? " USE" : "");
     text(13, y + 12, info, C_DIM, 1);
 
     char right[12];

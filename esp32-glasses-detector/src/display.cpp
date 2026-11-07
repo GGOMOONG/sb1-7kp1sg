@@ -83,7 +83,7 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
     } else {
       snprintf(right, sizeof(right), "%3lus", (unsigned long)((now - t.lastSeen) / 1000));
     }
-    char mark = usageState(t) == USAGE_CONNECTED ? '*' : ' ';
+    char mark = (t.category == CAT_UNKNOWN) ? '?' : (usageState(t) == USAGE_CONNECTED ? '*' : ' ');
     snprintf(buf, sizeof(buf), "%c%-14.14s%s", mark, t.vendor, right);
     if (first + r == selected) {
       u8g2.drawBox(0, y - 9, 128, 10);
@@ -94,7 +94,7 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
       u8g2.drawStr(1, y - 1, buf);
     }
   }
-  u8g2.drawStr(0, 63, "*=in use  hold=track");
+  u8g2.drawStr(0, 63, "*=use ?=unknown hold=trk");
   u8g2.sendBuffer();
 }
 
