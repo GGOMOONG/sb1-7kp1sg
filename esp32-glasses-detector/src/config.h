@@ -77,6 +77,17 @@
 #define BAT_DIVIDER 2.0f
 #endif
 
+// ---------- WiFi 카메라 스캔 ----------
+// 스파이 카메라는 영상 전송에 WiFi 핫스팟(AP)을 쓰는 경우가 많습니다.
+// ESP32 WiFi로 주변 AP를 주기적으로 스캔해 카메라형 SSID/OUI를 찾습니다.
+// BLE와 2.4GHz 라디오를 공유하므로, 간격을 넉넉히 둬서 BLE 수신 방해를 줄입니다.
+#ifndef ENABLE_WIFI_SCAN
+#define ENABLE_WIFI_SCAN 1   // 0이면 WiFi 스캔 끔(BLE만)
+#endif
+#ifndef WIFI_SCAN_INTERVAL_MS
+#define WIFI_SCAN_INTERVAL_MS 25000
+#endif
+
 // ---------- 탐지 ----------
 static const int RSSI_THRESHOLD = -95;       // 폰에 연결된 안경은 신호가 약하고 드물어서 낮게 잡습니다
 static const uint32_t REALERT_MS = 30000;    // 같은 대상을 다시 알리는 최소 간격

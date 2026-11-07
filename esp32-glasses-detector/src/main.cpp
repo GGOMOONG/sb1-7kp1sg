@@ -15,6 +15,7 @@
 #include "config.h"
 #include "detector.h"
 #include "display.h"
+#include "wifi_scan.h"
 
 namespace {
 
@@ -202,6 +203,7 @@ void setup() {
 
   displayBegin();
   detectorBegin();
+  wifiBegin();
   Serial.println("스마트글래스 BLE 탐지기 시작 - 스캔 중...");
   if (LOG_OBSERVATIONS) Serial.println("OBS,ms,id,address,company_id,rssi,connectable,legacy,name");
 }
@@ -212,6 +214,7 @@ void loop() {
   uint32_t now = millis();
 
   detectorProcess(onAlert);
+  wifiProcess();
   beeperUpdate(now);
   size_t n = detectorSnapshot(list, 16);
 
@@ -251,7 +254,8 @@ void loop() {
 
   if (now - lastDraw >= 120) {
     lastDraw = now;
-    UiStatus st{batteryPercent(), muted, detectorPacketsPerSec()};
+    int wifiN = ENABLE_WIFI_SCAN ? (int)wifiSuspectCount() : -1;
+    UiStatus st{batteryPercent(), muted, detectorPacketsPerSec(), wifiN, wifiTopSuspect()};
     if (alertUntil && (int32_t)(alertUntil - now) > 0) {
       displayAlert(alertTarget);
     } else if (mode == MODE_TRACK) {

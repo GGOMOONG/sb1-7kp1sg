@@ -94,7 +94,16 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
       u8g2.drawStr(1, y - 1, buf);
     }
   }
-  u8g2.drawStr(0, 63, "*=use ?=unknown hold=trk");
+  if (st.wifiSuspects > 0) {
+    char wbuf[26];
+    snprintf(wbuf, sizeof(wbuf), "WiFi cam? %d %.12s", st.wifiSuspects, st.wifiTop ? st.wifiTop : "");
+    u8g2.drawBox(0, 54, 128, 10);
+    u8g2.setDrawColor(0);
+    u8g2.drawStr(1, 63, wbuf);
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawStr(0, 63, "*=use ?=unknown hold=trk");
+  }
   u8g2.sendBuffer();
 }
 

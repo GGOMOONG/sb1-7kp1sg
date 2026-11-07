@@ -64,6 +64,22 @@ void drawHeader(const char* title, const UiStatus& st) {
   }
 }
 
+void drawWifiFooter(const UiStatus& st) {
+  if (st.wifiSuspects < 0) return;  // WiFi 스캔 꺼짐
+  const int16_t y = H - 11;
+  char buf[40];
+  if (st.wifiSuspects > 0) {
+    gfx->fillRect(0, y, W, 11, C_INUSE);
+    snprintf(buf, sizeof(buf), "WiFi cam? %d: %.18s", st.wifiSuspects, st.wifiTop ? st.wifiTop : "");
+    gfx->setTextColor(C_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(3, y + 2);
+    gfx->print(buf);
+  } else {
+    text(3, y + 2, "WiFi: no camera AP", C_DIM, 1);
+  }
+}
+
 }  // namespace
 
 void displayBegin() {
@@ -97,11 +113,12 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
     text((W - textW(b, 2)) / 2, 54, b, C_FG, 2);
     snprintf(b, sizeof(b), "%lu BLE pkt/s", (unsigned long)st.pps);
     text((W - textW(b, 1)) / 2, 84, b, C_DIM, 1);
+    drawWifiFooter(st);
     gfx->flush();
     return;
   }
 
-  const size_t rows = 5;
+  const size_t rows = 4;
   const int16_t rowH = 22;
   size_t first = (selected >= rows) ? selected - rows + 1 : 0;
   for (size_t r = 0; r < rows && first + r < n; r++) {
@@ -135,6 +152,7 @@ void displayList(const Target* list, size_t n, size_t selected, const UiStatus& 
       text(W - textW(right, 1) - 4, y + 7, right, C_DIM, 1);
     }
   }
+  drawWifiFooter(st);
   gfx->flush();
 }
 
